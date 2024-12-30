@@ -1,13 +1,83 @@
+# 1st edit by https://github.com/comfyanonymous/ComfyUI
+# 2nd edit by Forge Official
+
+
 import torch
 import ldm_patched.modules.model_management
+import contextlib
+
+from backend import stream
+
+
+# https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/14855/files
+stash = {}
+
+
+@contextlib.contextmanager
+def use_patched_ops(operations):
+    op_names = ['Linear', 'Conv2d', 'Conv3d', 'GroupNorm', 'LayerNorm']
+    backups = {op_name: getattr(torch.nn, op_name) for op_name in op_names}
+
+    try:
+        for op_name in op_names:
+            setattr(torch.nn, op_name, getattr(operations, op_name))
+
+        yield
+
+    finally:
+        for op_name in op_names:
+            setattr(torch.nn, op_name, backups[op_name])
+    return
+
 
 def cast_bias_weight(s, input):
-    bias = None
+    weight, bias, signal = None, None, None
     non_blocking = ldm_patched.modules.model_management.device_supports_non_blocking(input.device)
-    if s.bias is not None:
-        bias = s.bias.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
-    weight = s.weight.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
-    return weight, bias
+
+    if stream.stream_activated:
+        with stream.stream_context()(stream.mover_stream):
+            if s.bias is not None:
+                bias = s.bias.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
+            weight = s.weight.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
+            signal = stream.mover_stream.record_event()
+    else:
+        if s.bias is not None:
+            bias = s.bias.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
+        weight = s.weight.to(device=input.device, dtype=input.dtype, non_blocking=non_blocking)
+
+    return weight, bias, signal
+
+
+@contextlib.contextmanager
+def main_stream_worker(weight, bias, signal):
+    if not stream.stream_activated or signal is None:
+        yield
+        return
+
+    with stream.stream_context()(stream.current_stream):
+        stream.current_stream.wait_event(signal)
+        yield
+        finished_signal = stream.current_stream.record_event()
+        stash[id(finished_signal)] = (weight, bias, finished_signal)
+
+    garbage = []
+    for k, (w, b, s) in stash.items():
+        if s.query():
+            garbage.append(k)
+
+    for k in garbage:
+        del stash[k]
+    return
+
+
+def cleanup_cache():
+    if not stream.stream_activated:
+        return
+
+    stream.current_stream.synchronize()
+    stream.mover_stream.synchronize()
+    stash.clear()
+    return
 
 
 class disable_weight_init:
@@ -17,8 +87,9 @@ class disable_weight_init:
             return None
 
         def forward_ldm_patched_cast_weights(self, input):
-            weight, bias = cast_bias_weight(self, input)
-            return torch.nn.functional.linear(input, weight, bias)
+            weight, bias, signal = cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                return torch.nn.functional.linear(input, weight, bias)
 
         def forward(self, *args, **kwargs):
             if self.ldm_patched_cast_weights:
@@ -32,8 +103,9 @@ class disable_weight_init:
             return None
 
         def forward_ldm_patched_cast_weights(self, input):
-            weight, bias = cast_bias_weight(self, input)
-            return self._conv_forward(input, weight, bias)
+            weight, bias, signal = cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                return self._conv_forward(input, weight, bias)
 
         def forward(self, *args, **kwargs):
             if self.ldm_patched_cast_weights:
@@ -47,8 +119,9 @@ class disable_weight_init:
             return None
 
         def forward_ldm_patched_cast_weights(self, input):
-            weight, bias = cast_bias_weight(self, input)
-            return self._conv_forward(input, weight, bias)
+            weight, bias, signal = cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                return self._conv_forward(input, weight, bias)
 
         def forward(self, *args, **kwargs):
             if self.ldm_patched_cast_weights:
@@ -62,8 +135,9 @@ class disable_weight_init:
             return None
 
         def forward_ldm_patched_cast_weights(self, input):
-            weight, bias = cast_bias_weight(self, input)
-            return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
+            weight, bias, signal = cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
 
         def forward(self, *args, **kwargs):
             if self.ldm_patched_cast_weights:
@@ -78,8 +152,9 @@ class disable_weight_init:
             return None
 
         def forward_ldm_patched_cast_weights(self, input):
-            weight, bias = cast_bias_weight(self, input)
-            return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+            weight, bias, signal = cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
 
         def forward(self, *args, **kwargs):
             if self.ldm_patched_cast_weights:

@@ -2,7 +2,7 @@
 Modified from https://github.com/sczhou/CodeFormer
 VQGAN code, adapted from the original created by the Unleashing Transformers authors:
 https://github.com/samb-t/unleashing-transformers/blob/master/models/vqgan.py
-This version of the arch specifically was gathered from an old version of GFPGAN. If this is a problem, please contact me.
+This verison of the arch specifically was gathered from an old version of GFPGAN. If this is a problem, please contact me.
 """
 import math
 from typing import Optional
@@ -377,15 +377,15 @@ class VQAutoEncoder(nn.Module):
         )
 
         if model_path is not None:
-            chkpt = torch.load(model_path, map_location="cpu", weights_only=True)
+            chkpt = torch.load(model_path, map_location="cpu")
             if "params_ema" in chkpt:
                 self.load_state_dict(
-                    torch.load(model_path, map_location="cpu", weights_only=True)["params_ema"]
+                    torch.load(model_path, map_location="cpu")["params_ema"]
                 )
                 logger.info(f"vqgan is loaded from: {model_path} [params_ema]")
             elif "params" in chkpt:
                 self.load_state_dict(
-                    torch.load(model_path, map_location="cpu", weights_only=True)["params"]
+                    torch.load(model_path, map_location="cpu")["params"]
                 )
                 logger.info(f"vqgan is loaded from: {model_path} [params]")
             else:

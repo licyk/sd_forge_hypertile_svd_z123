@@ -1,3 +1,7 @@
+# 1st edit by https://github.com/comfyanonymous/ComfyUI
+# 2nd edit by Forge Official
+
+
 import torch
 import math
 import os
@@ -9,6 +13,8 @@ import ldm_patched.modules.ops
 
 import ldm_patched.controlnet.cldm
 import ldm_patched.t2ia.adapter
+
+from ldm_patched.modules.ops import main_stream_worker
 
 
 def broadcast_image_to(tensor, target_batch_size, batched_number):
@@ -29,6 +35,79 @@ def broadcast_image_to(tensor, target_batch_size, batched_number):
     else:
         return torch.cat([tensor] * batched_number, dim=0)
 
+
+def get_at(array, index, default=None):
+    return array[index] if 0 <= index < len(array) else default
+
+
+def compute_controlnet_weighting(control, cnet):
+
+    positive_advanced_weighting = getattr(cnet, 'positive_advanced_weighting', None)
+    negative_advanced_weighting = getattr(cnet, 'negative_advanced_weighting', None)
+    advanced_frame_weighting = getattr(cnet, 'advanced_frame_weighting', None)
+    advanced_sigma_weighting = getattr(cnet, 'advanced_sigma_weighting', None)
+    advanced_mask_weighting = getattr(cnet, 'advanced_mask_weighting', None)
+
+    transformer_options = cnet.transformer_options
+
+    if positive_advanced_weighting is None and negative_advanced_weighting is None \
+            and advanced_frame_weighting is None and advanced_sigma_weighting is None \
+            and advanced_mask_weighting is None:
+        return control
+
+    cond_or_uncond = transformer_options['cond_or_uncond']
+    sigmas = transformer_options['sigmas']
+    cond_mark = transformer_options['cond_mark']
+
+    if advanced_frame_weighting is not None:
+        advanced_frame_weighting = torch.Tensor(advanced_frame_weighting * len(cond_or_uncond)).to(sigmas)
+        assert advanced_frame_weighting.shape[0] == cond_mark.shape[0], \
+            'Frame weighting list length is different from batch size!'
+
+    if advanced_sigma_weighting is not None:
+        advanced_sigma_weighting = torch.cat([advanced_sigma_weighting(sigmas)] * len(cond_or_uncond))
+
+    for k, v in control.items():
+        for i in range(len(v)):
+            control_signal = control[k][i]
+
+            if not isinstance(control_signal, torch.Tensor):
+                continue
+
+            B, C, H, W = control_signal.shape
+
+            positive_weight = 1.0
+            negative_weight = 1.0
+            sigma_weight = 1.0
+            frame_weight = 1.0
+
+            if positive_advanced_weighting is not None:
+                positive_weight = get_at(positive_advanced_weighting.get(k, []), i, 1.0)
+
+            if negative_advanced_weighting is not None:
+                negative_weight = get_at(negative_advanced_weighting.get(k, []), i, 1.0)
+
+            if advanced_sigma_weighting is not None:
+                sigma_weight = advanced_sigma_weighting
+
+            if advanced_frame_weighting is not None:
+                frame_weight = advanced_frame_weighting
+
+            final_weight = positive_weight * (1.0 - cond_mark) + negative_weight * cond_mark
+            final_weight = final_weight * sigma_weight * frame_weight
+
+            if isinstance(advanced_mask_weighting, torch.Tensor):
+                if advanced_mask_weighting.shape[0] != 1:
+                    k_ = int(control_signal.shape[0] // advanced_mask_weighting.shape[0])
+                    if control_signal.shape[0] == k_ * advanced_mask_weighting.shape[0]:
+                        advanced_mask_weighting = advanced_mask_weighting.repeat(k_, 1, 1, 1)
+                control_signal = control_signal * torch.nn.functional.interpolate(advanced_mask_weighting.to(control_signal), size=(H, W), mode='bilinear')
+
+            control[k][i] = control_signal * final_weight[:, None, None, None]
+
+    return control
+
+
 class ControlBase:
     def __init__(self, device=None):
         self.cond_hint_original = None
@@ -37,6 +116,7 @@ class ControlBase:
         self.timestep_percent_range = (0.0, 1.0)
         self.global_average_pooling = False
         self.timestep_range = None
+        self.transformer_options = {}
 
         if device is None:
             device = ldm_patched.modules.model_management.get_torch_device()
@@ -114,6 +194,9 @@ class ControlBase:
                         x = x.to(output_dtype)
 
                 out[key].append(x)
+
+        out = compute_controlnet_weighting(out, self)
+
         if control_prev is not None:
             for x in ['input', 'middle', 'output']:
                 o = out[x]
@@ -142,6 +225,11 @@ class ControlNet(ControlBase):
         self.manual_cast_dtype = manual_cast_dtype
 
     def get_control(self, x_noisy, t, cond, batched_number):
+        to = self.transformer_options
+
+        for conditioning_modifier in to.get('controlnet_conditioning_modifiers', []):
+            x_noisy, t, cond, batched_number = conditioning_modifier(self, x_noisy, t, cond, batched_number)
+
         control_prev = None
         if self.previous_controlnet is not None:
             control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number)
@@ -162,7 +250,7 @@ class ControlNet(ControlBase):
             if self.cond_hint is not None:
                 del self.cond_hint
             self.cond_hint = None
-            self.cond_hint = ldm_patched.modules.utils.common_upscale(self.cond_hint_original, x_noisy.shape[3] * 8, x_noisy.shape[2] * 8, 'nearest-exact', "center").to(dtype).to(self.device)
+            self.cond_hint = ldm_patched.modules.utils.common_upscale(self.cond_hint_original, x_noisy.shape[3] * 8, x_noisy.shape[2] * 8, 'nearest-exact', "center").to(dtype)
         if x_noisy.shape[0] != self.cond_hint.shape[0]:
             self.cond_hint = broadcast_image_to(self.cond_hint, x_noisy.shape[0], batched_number)
 
@@ -173,7 +261,16 @@ class ControlNet(ControlBase):
         timestep = self.model_sampling_current.timestep(t)
         x_noisy = self.model_sampling_current.calculate_input(t, x_noisy)
 
-        control = self.control_model(x=x_noisy.to(dtype), hint=self.cond_hint, timesteps=timestep.float(), context=context.to(dtype), y=y)
+        controlnet_model_function_wrapper = to.get('controlnet_model_function_wrapper', None)
+
+        if controlnet_model_function_wrapper is not None:
+            wrapper_args = dict(x=x_noisy.to(dtype), hint=self.cond_hint, timesteps=timestep.float(),
+                                context=context.to(dtype), y=y)
+            wrapper_args['model'] = self
+            wrapper_args['inner_model'] = self.control_model
+            control = controlnet_model_function_wrapper(**wrapper_args)
+        else:
+            control = self.control_model(x=x_noisy.to(dtype), hint=self.cond_hint.to(self.device), timesteps=timestep.float(), context=context.to(dtype), y=y)
         return self.control_merge(None, control, control_prev, output_dtype)
 
     def copy(self):
@@ -208,11 +305,12 @@ class ControlLoraOps:
             self.bias = None
 
         def forward(self, input):
-            weight, bias = ldm_patched.modules.ops.cast_bias_weight(self, input)
-            if self.up is not None:
-                return torch.nn.functional.linear(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias)
-            else:
-                return torch.nn.functional.linear(input, weight, bias)
+            weight, bias, signal = ldm_patched.modules.ops.cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                if self.up is not None:
+                    return torch.nn.functional.linear(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias)
+                else:
+                    return torch.nn.functional.linear(input, weight, bias)
 
     class Conv2d(torch.nn.Module):
         def __init__(
@@ -248,11 +346,12 @@ class ControlLoraOps:
 
 
         def forward(self, input):
-            weight, bias = ldm_patched.modules.ops.cast_bias_weight(self, input)
-            if self.up is not None:
-                return torch.nn.functional.conv2d(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias, self.stride, self.padding, self.dilation, self.groups)
-            else:
-                return torch.nn.functional.conv2d(input, weight, bias, self.stride, self.padding, self.dilation, self.groups)
+            weight, bias, signal = ldm_patched.modules.ops.cast_bias_weight(self, input)
+            with main_stream_worker(weight, bias, signal):
+                if self.up is not None:
+                    return torch.nn.functional.conv2d(input, weight + (torch.mm(self.up.flatten(start_dim=1), self.down.flatten(start_dim=1))).reshape(self.weight.shape).type(input.dtype), bias, self.stride, self.padding, self.dilation, self.groups)
+                else:
+                    return torch.nn.functional.conv2d(input, weight, bias, self.stride, self.padding, self.dilation, self.groups)
 
 
 class ControlLora(ControlNet):
@@ -436,6 +535,11 @@ class T2IAdapter(ControlBase):
         return width, height
 
     def get_control(self, x_noisy, t, cond, batched_number):
+        to = self.transformer_options
+
+        for conditioning_modifier in to.get('controlnet_conditioning_modifiers', []):
+            x_noisy, t, cond, batched_number = conditioning_modifier(self, x_noisy, t, cond, batched_number)
+
         control_prev = None
         if self.previous_controlnet is not None:
             control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number)
@@ -453,7 +557,7 @@ class T2IAdapter(ControlBase):
             self.control_input = None
             self.cond_hint = None
             width, height = self.scale_image_to(x_noisy.shape[3] * 8, x_noisy.shape[2] * 8)
-            self.cond_hint = ldm_patched.modules.utils.common_upscale(self.cond_hint_original, width, height, 'nearest-exact', "center").float().to(self.device)
+            self.cond_hint = ldm_patched.modules.utils.common_upscale(self.cond_hint_original, width, height, 'nearest-exact', "center").float()
             if self.channels_in == 1 and self.cond_hint.shape[1] > 1:
                 self.cond_hint = torch.mean(self.cond_hint, 1, keepdim=True)
         if x_noisy.shape[0] != self.cond_hint.shape[0]:
@@ -461,7 +565,18 @@ class T2IAdapter(ControlBase):
         if self.control_input is None:
             self.t2i_model.to(x_noisy.dtype)
             self.t2i_model.to(self.device)
-            self.control_input = self.t2i_model(self.cond_hint.to(x_noisy.dtype))
+
+            controlnet_model_function_wrapper = to.get('controlnet_model_function_wrapper', None)
+
+            if controlnet_model_function_wrapper is not None:
+                wrapper_args = dict(hint=self.cond_hint.to(x_noisy.dtype))
+                wrapper_args['model'] = self
+                wrapper_args['inner_model'] = self.t2i_model
+                wrapper_args['inner_t2i_model'] = self.t2i_model
+                self.control_input = controlnet_model_function_wrapper(**wrapper_args)
+            else:
+                self.control_input = self.t2i_model(self.cond_hint.to(x_noisy))
+
             self.t2i_model.cpu()
 
         control_input = list(map(lambda a: None if a is None else a.clone(), self.control_input))

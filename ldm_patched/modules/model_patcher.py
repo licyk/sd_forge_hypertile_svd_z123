@@ -1,9 +1,17 @@
+# 1st edit by https://github.com/comfyanonymous/ComfyUI
+# 2nd edit by Forge Official
+
+
 import torch
 import copy
 import inspect
 
 import ldm_patched.modules.utils
 import ldm_patched.modules.model_management
+
+
+extra_weight_calculators = {}
+
 
 class ModelPatcher:
     def __init__(self, model, load_device, offload_device, size=0, current_device=None, weight_inplace_update=False):
@@ -66,6 +74,12 @@ class ModelPatcher:
 
     def set_model_unet_function_wrapper(self, unet_wrapper_function):
         self.model_options["model_function_wrapper"] = unet_wrapper_function
+
+    def set_model_vae_encode_wrapper(self, wrapper_function):
+        self.model_options["model_vae_encode_wrapper"] = wrapper_function
+
+    def set_model_vae_decode_wrapper(self, wrapper_function):
+        self.model_options["model_vae_decode_wrapper"] = wrapper_function
 
     def set_model_patch(self, patch, name):
         to = self.model_options["transformer_options"]
@@ -176,10 +190,10 @@ class ModelPatcher:
 
     def patch_model(self, device_to=None, patch_weights=True):
         for k in self.object_patches:
-            old = getattr(self.model, k)
+            old = ldm_patched.modules.utils.get_attr(self.model, k)
             if k not in self.object_patches_backup:
                 self.object_patches_backup[k] = old
-            setattr(self.model, k, self.object_patches[k])
+            ldm_patched.modules.utils.set_attr_raw(self.model, k, self.object_patches[k])
 
         if patch_weights:
             model_sd = self.model_state_dict()
@@ -234,7 +248,17 @@ class ModelPatcher:
                 w1 = v[0]
                 if alpha != 0.0:
                     if w1.shape != weight.shape:
-                        print("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, w1.shape, weight.shape))
+                        if w1.ndim == weight.ndim == 4:
+                            new_shape = [max(n, m) for n, m in zip(weight.shape, w1.shape)]
+                            print(f'Merged with {key} channel changed to {new_shape}')
+                            new_diff = alpha * ldm_patched.modules.model_management.cast_to_device(w1, weight.device, weight.dtype)
+                            new_weight = torch.zeros(size=new_shape).to(weight)
+                            new_weight[:weight.shape[0], :weight.shape[1], :weight.shape[2], :weight.shape[3]] = weight
+                            new_weight[:new_diff.shape[0], :new_diff.shape[1], :new_diff.shape[2], :new_diff.shape[3]] += new_diff
+                            new_weight = new_weight.contiguous().clone()
+                            weight = new_weight
+                        else:
+                            print("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, w1.shape, weight.shape))
                     else:
                         weight += alpha * ldm_patched.modules.model_management.cast_to_device(w1, weight.device, weight.dtype)
             elif patch_type == "lora": #lora/locon
@@ -329,6 +353,8 @@ class ModelPatcher:
                 b2 = ldm_patched.modules.model_management.cast_to_device(v[3].flatten(start_dim=1), weight.device, torch.float32)
 
                 weight += ((torch.mm(b2, b1) + torch.mm(torch.mm(weight.flatten(start_dim=1), a2), a1)) * alpha).reshape(weight.shape).type(weight.dtype)
+            elif patch_type in extra_weight_calculators:
+                weight = extra_weight_calculators[patch_type](weight, alpha, v)
             else:
                 print("patch type not recognized", patch_type, key)
 
@@ -352,6 +378,6 @@ class ModelPatcher:
 
         keys = list(self.object_patches_backup.keys())
         for k in keys:
-            setattr(self.model, k, self.object_patches_backup[k])
+            ldm_patched.modules.utils.set_attr_raw(self.model, k, self.object_patches_backup[k])
 
         self.object_patches_backup = {}

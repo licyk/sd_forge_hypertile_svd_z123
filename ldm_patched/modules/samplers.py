@@ -1,3 +1,7 @@
+# 1st edit by https://github.com/comfyanonymous/ComfyUI
+# 2nd edit by Forge Official
+
+
 from ldm_patched.k_diffusion import sampling as k_diffusion_sampling
 from ldm_patched.unipc import uni_pc
 import torch
@@ -126,6 +130,29 @@ def cond_cat(c_list):
 
     return out
 
+def compute_cond_mark(cond_or_uncond, sigmas):
+    cond_or_uncond_size = int(sigmas.shape[0])
+
+    cond_mark = []
+    for cx in cond_or_uncond:
+        cond_mark += [cx] * cond_or_uncond_size
+
+    cond_mark = torch.Tensor(cond_mark).to(sigmas)
+    return cond_mark
+
+def compute_cond_indices(cond_or_uncond, sigmas):
+    cl = int(sigmas.shape[0])
+
+    cond_indices = []
+    uncond_indices = []
+    for i, cx in enumerate(cond_or_uncond):
+        if cx == 0:
+            cond_indices += list(range(i * cl, (i + 1) * cl))
+        else:
+            uncond_indices += list(range(i * cl, (i + 1) * cl))
+
+    return cond_indices, uncond_indices
+
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     out_cond = torch.zeros_like(x_in)
     out_count = torch.ones_like(x_in) * 1e-37
@@ -193,9 +220,6 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
         c = cond_cat(c)
         timestep_ = torch.cat([timestep] * batch_chunks)
 
-        if control is not None:
-            c['control'] = control.get_control(input_x, timestep_, c, len(cond_or_uncond))
-
         transformer_options = {}
         if 'transformer_options' in model_options:
             transformer_options = model_options['transformer_options'].copy()
@@ -214,7 +238,19 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
         transformer_options["cond_or_uncond"] = cond_or_uncond[:]
         transformer_options["sigmas"] = timestep
 
+        transformer_options["cond_mark"] = compute_cond_mark(cond_or_uncond=cond_or_uncond, sigmas=timestep)
+        transformer_options["cond_indices"], transformer_options["uncond_indices"] = compute_cond_indices(cond_or_uncond=cond_or_uncond, sigmas=timestep)
+
         c['transformer_options'] = transformer_options
+
+        if control is not None:
+            p = control
+            while p is not None:
+                p.transformer_options = transformer_options
+                p = p.previous_controlnet
+            control_cond = c.copy()  # get_control may change items in this dict, so we need to copy it
+            c['control'] = control.get_control(input_x, timestep_, control_cond, len(cond_or_uncond))
+            c['control_model'] = control
 
         if 'model_function_wrapper' in model_options:
             output = model_options['model_function_wrapper'](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
@@ -240,16 +276,24 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
 #The main sampling function shared by all the samplers
 #Returns denoised
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+        edit_strength = sum((item['strength'] if 'strength' in item else 1) for item in cond)
+
         if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
             uncond_ = None
         else:
             uncond_ = uncond
 
+        for fn in model_options.get("sampler_pre_cfg_function", []):
+            model, cond, uncond_, x, timestep, model_options = fn(model, cond, uncond_, x, timestep, model_options)
+
         cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
+
         if "sampler_cfg_function" in model_options:
             args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep,
                     "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
             cfg_result = x - model_options["sampler_cfg_function"](args)
+        elif not math.isclose(edit_strength, 1.0):
+            cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
         else:
             cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale
 
@@ -523,7 +567,7 @@ class UNIPCBH2(Sampler):
 
 KSAMPLER_NAMES = ["euler", "euler_ancestral", "heun", "heunpp2","dpm_2", "dpm_2_ancestral",
                   "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu",
-                  "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm", "tcd", "edm_playground_v2.5", "restart"]
+                  "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm"]
 
 class KSAMPLER(Sampler):
     def __init__(self, sampler_function, extra_options={}, inpaint_options={}):

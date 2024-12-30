@@ -1,3 +1,7 @@
+# 1st edit https://github.com/comfyanonymous/ComfyUI
+# 2nd edit by Forge
+
+
 import torch
 import math
 import struct
@@ -5,6 +9,7 @@ import ldm_patched.modules.checkpoint_pickle
 import safetensors.torch
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 def load_torch_file(ckpt, safe_load=False, device=None):
     if device is None:
@@ -281,6 +286,12 @@ def set_attr(obj, attr, value):
     setattr(obj, attrs[-1], torch.nn.Parameter(value, requires_grad=False))
     del prev
 
+def set_attr_raw(obj, attr, value):
+    attrs = attr.split(".")
+    for name in attrs[:-1]:
+        obj = getattr(obj, name)
+    setattr(obj, attrs[-1], value)
+
 def copy_to_param(obj, attr, value):
     # inplace update tensor instead of replacing it
     attrs = attr.split(".")
@@ -413,6 +424,8 @@ def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap = 8, upscale_am
         out_div = torch.zeros((s.shape[0], out_channels, round(s.shape[2] * upscale_amount), round(s.shape[3] * upscale_amount)), device=output_device)
         for y in range(0, s.shape[2], tile_y - overlap):
             for x in range(0, s.shape[3], tile_x - overlap):
+                x = max(0, min(s.shape[-1] - overlap, x))
+                y = max(0, min(s.shape[-2] - overlap, y))
                 s_in = s[:,:,y:y+tile_y,x:x+tile_x]
 
                 ps = function(s_in).to(output_device)
@@ -442,20 +455,25 @@ def set_progress_bar_global_hook(function):
     PROGRESS_BAR_HOOK = function
 
 class ProgressBar:
-    def __init__(self, total):
+    def __init__(self, total, title=None):
         global PROGRESS_BAR_HOOK
         self.total = total
         self.current = 0
         self.hook = PROGRESS_BAR_HOOK
+        self.tqdm = tqdm(total=total, desc=title)
 
     def update_absolute(self, value, total=None, preview=None):
         if total is not None:
             self.total = total
         if value > self.total:
             value = self.total
+        inc = value - self.current
+        self.tqdm.update(inc)
         self.current = value
         if self.hook is not None:
             self.hook(self.current, self.total, preview)
+        if self.current >= self.total:
+            self.tqdm.close()
 
     def update(self, value):
         self.update_absolute(self.current + value)

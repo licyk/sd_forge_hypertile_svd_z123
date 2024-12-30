@@ -1,3 +1,6 @@
+# Taken from https://github.com/comfyanonymous/ComfyUI
+
+
 import torch
 from . import model_base
 from . import utils
@@ -21,6 +24,7 @@ class BASE:
     noise_aug_config = None
     sampling_settings = {}
     latent_format = latent_formats.LatentFormat
+    vae_key_prefix = ["first_stage_model."]
 
     manual_cast_dtype = None
 

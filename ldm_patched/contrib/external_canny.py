@@ -1,4 +1,6 @@
-# https://github.com/comfyanonymous/ComfyUI/blob/master/nodes.py 
+# Taken from https://github.com/comfyanonymous/ComfyUI
+# This file is only for reference, and not used in the backend or runtime.
+
 
 #From https://github.com/kornia/kornia
 import math
@@ -78,7 +80,7 @@ def spatial_gradient(input, normalized: bool = True):
     Return:
         the derivatives of the input feature map. with shape :math:`(B, C, 2, H, W)`.
     .. note::
-       See a working example `here <https://kornia.readthedocs.io/en/latest/
+       See a working example `here <https://kornia-tutorials.readthedocs.io/en/latest/
        filtering_edges.html>`__.
     Examples:
         >>> input = torch.rand(1, 3, 4, 4)
@@ -120,7 +122,7 @@ def rgb_to_grayscale(image, rgb_weights = None):
         grayscale version of the image with shape :math:`(*,1,H,W)`.
 
     .. note::
-       See a working example `here <https://kornia.readthedocs.io/en/latest/
+       See a working example `here <https://kornia-tutorials.readthedocs.io/en/latest/
        color_conversions.html>`__.
 
     Example:
@@ -176,7 +178,7 @@ def canny(
         - the canny edge magnitudes map, shape of :math:`(B,1,H,W)`.
         - the canny edge detection filtered by thresholds and hysteresis, shape of :math:`(B,1,H,W)`.
     .. note::
-       See a working example `here <https://kornia.readthedocs.io/en/latest/
+       See a working example `here <https://kornia-tutorials.readthedocs.io/en/latest/
        canny.html>`__.
     Example:
         >>> input = torch.rand(5, 3, 4, 4)
