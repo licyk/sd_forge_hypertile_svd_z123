@@ -6,7 +6,8 @@ import time
 import psutil
 from enum import Enum
 from ldm_patched.modules.args_parser import args
-from backend import stream
+# from backend import stream
+from ldm_patched.modules import stream
 import ldm_patched.modules.utils
 import torch
 import sys
