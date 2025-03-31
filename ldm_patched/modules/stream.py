@@ -60,3 +60,4 @@ def should_use_stream():
 current_stream = get_current_stream()
 mover_stream = get_new_stream()
 stream_activated = args.cuda_stream
+using_stream = stream_activated
